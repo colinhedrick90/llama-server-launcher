@@ -1,0 +1,93 @@
+name: Test and build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            artifact: LlamaServerLauncher-windows-x64.exe
+          # Oldest supported Ubuntu runner: a binary linked against an older
+          # glibc still runs on newer releases, not the other way round.
+          - label: Ubuntu
+            os: ubuntu-24.04
+            artifact: LlamaServerLauncher-linux-x64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Import check (UI module)
+        run: python -c "import launcher_app, main"
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./build.ps1
+          Move-Item LlamaServerLauncher.exe "${{ matrix.artifact }}"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./build.sh
+          mv dist/LlamaServerLauncher "${{ matrix.artifact }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+
+  release:
+    name: Publish binaries
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Versioned release (tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+
+      - name: Rolling "latest" pre-release (main push)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Latest build (main)" \
+            --notes "Automated build of ${GITHUB_SHA}. Rebuilt on every push to main."

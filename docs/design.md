@@ -2,14 +2,15 @@
 
 ## Purpose
 
-Provide a lightweight native Windows interface for configuring and managing one
-`llama-server` process. The packaged application must be suitable for pinning to
-the taskbar and must stop its managed server when the application closes.
+Provide a lightweight native interface for configuring and managing one
+`llama-server` process on Windows and Linux from a single codebase. The packaged
+application must be suitable for pinning to the taskbar or app grid and must
+stop its managed server when the application closes.
 
 ## Interface
 
 - Select and save multiple named profiles.
-- Automatically detect `llama-server.exe` and available devices.
+- Automatically detect `llama-server` and available devices.
 - Scan the Hugging Face cache and one optional custom folder recursively for
   `.gguf` model files.
 - Configure model, device, GPU layers, context size, parallel slots, host, port,
@@ -26,11 +27,17 @@ the taskbar and must stop its managed server when the application closes.
 - List models currently holding VRAM in router mode and unload one or all of
   them through the server's `/models/unload` HTTP endpoint for a clean slate.
 - Start, stop, and restart the managed server.
-- Display process status and live server logs.
+- Display process status and live server logs on a dedicated Log tab with
+  clear, copy, and auto-scroll controls.
+- Control the FIM context proxy and edit the `fim-ghost` ghost-text, sampling,
+  and retrieval settings from a FIM Proxy tab.
 
 ## Behavior
 
-Settings are stored in `%LOCALAPPDATA%\LlamaServerLauncher\settings.json`.
+Settings are stored per user: `%LOCALAPPDATA%\LlamaServerLauncher\settings.json`
+on Windows and `$XDG_CONFIG_HOME/LlamaServerLauncher/settings.json` on Linux.
+No machine-specific paths or credentials live in the source tree; platform
+differences are isolated behind `IS_WINDOWS` in `launcher_core.py`.
 Profiles contain all launch settings. The application prevents launch when the
 configured port is already occupied. It only stops a server process that it
 started. Closing the application gracefully terminates that process, waits, and
