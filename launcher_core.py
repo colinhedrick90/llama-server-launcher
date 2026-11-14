@@ -707,6 +707,7 @@ class SettingsStore:
             "llama_server": find_llama_server(),
             "custom_model_folder": "",
             "hf_cache_dir": default_hf_cache_dir(),
+            "fim_proxy_config": FIM_PROXY_CONFIG,
             "selected_profile": "Default",
             "profiles": {"Default": dict(DEFAULT_PROFILE)},
         }
@@ -809,6 +810,8 @@ class ManagedServer:
 
 FIM_PROXY_TASK = "llama-fim-context-proxy"
 FIM_PROXY_HEALTH_URL = "http://127.0.0.1:8012/health"
+# Default location only. The config can live anywhere; the UI lets the user
+# browse to it and the choice is stored in settings.json ("fim_proxy_config").
 FIM_PROXY_CONFIG = str(Path.home() / "llama-fim-context-proxy" / "config.toml")
 
 # The FIM proxy is driven by a Windows Scheduled Task so it outlives this app
@@ -941,26 +944,33 @@ def fim_ext_config_load() -> dict:
         return {}
 
 
-def fim_retrieval_enabled_get() -> bool:
+def fim_proxy_config_path(config_path: str | None = None) -> str:
+    """Resolve the proxy config.toml to use: the given path, else the default."""
+    chosen = (config_path or "").strip() or FIM_PROXY_CONFIG
+    return str(Path(chosen).expanduser())
+
+
+def fim_retrieval_enabled_get(config_path: str | None = None) -> bool:
     """Read [retrieval].enabled from the proxy config.toml (default True)."""
     try:
         import tomllib
 
-        with open(FIM_PROXY_CONFIG, "rb") as handle:
+        with open(fim_proxy_config_path(config_path), "rb") as handle:
             data = tomllib.load(handle)
         return bool(data.get("retrieval", {}).get("enabled", True))
     except (OSError, ValueError):
         return True
 
 
-def fim_retrieval_enabled_set(value: bool) -> None:
+def fim_retrieval_enabled_set(value: bool, config_path: str | None = None) -> None:
     """Flip [retrieval].enabled in config.toml, preserving comments/formatting.
 
     Line-targeted (not a full TOML rewrite) so the surrounding comments survive.
     The proxy reads config.toml only at startup, so this needs a proxy restart.
     """
     token = "true" if value else "false"
-    with open(FIM_PROXY_CONFIG, "r", encoding="utf-8") as handle:
+    target = fim_proxy_config_path(config_path)
+    with open(target, "r", encoding="utf-8") as handle:
         lines = handle.readlines()
     in_retrieval = False
     for i, line in enumerate(lines):
@@ -978,7 +988,7 @@ def fim_retrieval_enabled_set(value: bool) -> None:
                 break
         else:
             raise RuntimeError("[retrieval] section not found in config.toml")
-    with open(FIM_PROXY_CONFIG, "w", encoding="utf-8") as handle:
+    with open(target, "w", encoding="utf-8") as handle:
         handle.writelines(lines)
 
 

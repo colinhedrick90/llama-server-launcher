@@ -20,6 +20,7 @@ from launcher_core import (
     discover_models,
     fim_ext_config_load,
     fim_ext_config_save,
+    fim_proxy_config_path,
     fim_retrieval_enabled_get,
     fim_retrieval_enabled_set,
     model_download_dir,
@@ -603,6 +604,33 @@ class FimConfigTests(unittest.TestCase):
             self.assertEqual("# semantic retrieval", lines[5])
             self.assertEqual("enabled = false", lines[6])
             self.assertEqual("top_k = 4", lines[7])
+
+    def test_retrieval_toggle_uses_a_user_selected_config_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            default = Path(temp) / "default.toml"
+            chosen = Path(temp) / "elsewhere" / "my-proxy.toml"
+            chosen.parent.mkdir()
+            default.write_text("[retrieval]\nenabled = true\n", encoding="utf-8")
+            chosen.write_text("[retrieval]\nenabled = true\n", encoding="utf-8")
+            with mock.patch.object(launcher_core, "FIM_PROXY_CONFIG", str(default)):
+                fim_retrieval_enabled_set(False, str(chosen))
+
+                self.assertFalse(fim_retrieval_enabled_get(str(chosen)))
+                # The default file is untouched, and a blank path falls back to it.
+                self.assertTrue(fim_retrieval_enabled_get())
+                self.assertTrue(fim_retrieval_enabled_get("  "))
+                self.assertEqual(str(default), fim_proxy_config_path(""))
+                self.assertEqual(str(chosen), fim_proxy_config_path(str(chosen)))
+
+    def test_proxy_config_path_is_stored_in_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = SettingsStore(Path(temp) / "settings.json")
+            settings = store.load()
+            self.assertEqual(launcher_core.FIM_PROXY_CONFIG, settings["fim_proxy_config"])
+
+            settings["fim_proxy_config"] = "/somewhere/else/config.toml"
+            store.save(settings)
+            self.assertEqual("/somewhere/else/config.toml", store.load()["fim_proxy_config"])
 
     def test_retrieval_defaults_to_enabled_when_config_is_missing(self):
         with tempfile.TemporaryDirectory() as temp:

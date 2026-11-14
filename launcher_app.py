@@ -152,7 +152,9 @@ class LauncherApp:
         self.fim_endpoint = tk.StringVar(value=FIM_PROXY_HEALTH_URL.replace("/health", ""))
         self.fim_backend = tk.StringVar(value="-")
         self.fim_chunks = tk.StringVar(value="-")
-        self.fim_config = tk.StringVar(value=FIM_PROXY_CONFIG)
+        self.fim_config = tk.StringVar(
+            value=self.settings.get("fim_proxy_config") or FIM_PROXY_CONFIG
+        )
 
         # fim-ghost extension ghost-text settings (fim.config.json, hot-reloads)
         self.fim_enabled = tk.BooleanVar(value=True)
@@ -539,11 +541,16 @@ class LauncherApp:
             ("Endpoint", self.fim_endpoint),
             ("Backend", self.fim_backend),
             ("Indexed chunks", self.fim_chunks),
-            ("Config", self.fim_config),
         )
         for index, (label, variable) in enumerate(rows):
             ttk.Label(info, text=label).grid(row=index, column=0, sticky="w", pady=2)
             ttk.Label(info, textvariable=variable).grid(row=index, column=1, sticky="w", padx=8, pady=2)
+        # The proxy's config.toml can live anywhere, so it is a path row like
+        # llama-server on the Server tab: type or Browse, Refresh re-reads it.
+        self._path_row(
+            info, len(rows), "Config", self.fim_config,
+            self.browse_fim_config, self.refresh_fim_config,
+        )
 
         controls = ttk.Frame(parent)
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -556,9 +563,9 @@ class LauncherApp:
         note = ttk.Label(
             parent,
             text=(
-                "The proxy is registered as a logon scheduled task, so it starts with your "
-                "session and survives VS Code reloads. Stopping it here also stops the "
-                "llama-server backend on 8014 (kill-on-close job object)."
+                "Start the proxy, then start your editor and it will survive editor "
+                "reloads. Stopping it here also stops the llama-server backend on 8014 "
+                "(kill-on-close job object)."
             ),
             wraplength=560,
             justify="left",
@@ -647,9 +654,29 @@ class LauncherApp:
 
         self.load_fim_settings()
 
+    def browse_fim_config(self) -> None:
+        current = Path(self.fim_config.get() or FIM_PROXY_CONFIG).expanduser()
+        path = filedialog.askopenfilename(
+            initialdir=str(current.parent if current.parent.is_dir() else Path.home()),
+            filetypes=[("TOML files", "*.toml"), ("All files", "*.*")],
+        )
+        if path:
+            self.fim_config.set(path)
+            self.refresh_fim_config()
+
+    def refresh_fim_config(self) -> None:
+        """Remember the chosen proxy config and re-read the settings kept in it."""
+        path = self.fim_config.get().strip() or FIM_PROXY_CONFIG
+        self.fim_config.set(path)
+        self.settings["fim_proxy_config"] = path
+        self.store.save(self.settings)
+        self.load_fim_settings()
+        if not Path(path).expanduser().is_file():
+            self.fim_settings_status.set("proxy config not found - check the Config path")
+
     def load_fim_settings(self) -> None:
         # Retrieval lives in the proxy config.toml, independent of the extension JSON.
-        self.fim_retrieval_enabled.set(fim_retrieval_enabled_get())
+        self.fim_retrieval_enabled.set(fim_retrieval_enabled_get(self.fim_config.get()))
         data = fim_ext_config_load()
         if not data:
             self.fim_settings_status.set("config not found")
@@ -707,8 +734,9 @@ class LauncherApp:
         retr_changed = False
         try:
             want = bool(self.fim_retrieval_enabled.get())
-            retr_changed = fim_retrieval_enabled_get() != want
-            fim_retrieval_enabled_set(want)
+            config_path = self.fim_config.get()
+            retr_changed = fim_retrieval_enabled_get(config_path) != want
+            fim_retrieval_enabled_set(want, config_path)
         except (OSError, RuntimeError) as exc:
             self._append_log(f"[fim] retrieval toggle write failed: {exc}")
         if retr_changed:
@@ -907,6 +935,7 @@ class LauncherApp:
         self.settings["llama_server"] = self.server_path.get()
         self.settings["custom_model_folder"] = self.custom_folder.get()
         self.settings["hf_cache_dir"] = self.hf_cache_dir.get()
+        self.settings["fim_proxy_config"] = self.fim_config.get().strip() or FIM_PROXY_CONFIG
         self.store.save(self.settings)
         self._refresh_profiles()
         self._append_log(f"[launcher] Saved profile: {name}")

@@ -42,7 +42,7 @@ user at runtime, and everything you configure is saved locally:
 | Model root | `C:\localai` | `~/models` |
 | VRAM readout | PowerShell GPU performance counter | DRM fdinfo under `/proc/<pid>/fdinfo` |
 | FIM proxy control | Scheduled Task `llama-fim-context-proxy` | not wired up yet (reports *Unavailable*) |
-| FIM proxy config | `~/llama-fim-context-proxy/config.toml` | same |
+| FIM proxy config | any path — default `~/llama-fim-context-proxy/config.toml` | same |
 
 Secrets are never written to profiles by the launcher itself:
 
@@ -100,7 +100,12 @@ more entries than the preset defines.
 
 **Start / Stop / Restart Proxy** drive the `llama-fim-context-proxy` Scheduled
 Task on Windows. On Linux those buttons report *Unavailable* until a
-`systemd --user` unit is wired up.
+`systemd --user` unit is wired up. Start the proxy, then start your editor, and
+it survives editor reloads.
+
+**Config** is the proxy's `config.toml`. Type a path or **Browse** to it
+wherever it lives; **Refresh** re-reads it. The choice is remembered in your
+local `settings.json`.
 
 The settings below the controls work on both platforms:
 
@@ -110,7 +115,7 @@ The settings below the controls work on both platforms:
   which the extension hot-reloads.
 - **Sampling** — temperature, top-p, top-k, and the frequency / presence /
   repeat penalties passed through to `/infill`. Hover a name for what it does.
-- **Retrieval enabled** — flips `[retrieval].enabled` in the proxy's
+- **Retrieval enabled** — flips `[retrieval].enabled` in the selected
   `config.toml` in place, preserving comments. Takes effect after
   **Restart Proxy**.
 
