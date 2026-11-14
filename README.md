@@ -4,6 +4,24 @@ A lightweight Tkinter launcher for configuring and managing
 [`llama-server`](https://github.com/ggml-org/llama.cpp). One codebase, runs on
 Windows and Linux.
 
+<p align="center">
+  <img src="docs/screenshots/server-tab.png" width="760"
+       alt="Server tab on Windows: profile selector, server configuration, router mode, Hugging Face download, cache removal, and loaded-model controls">
+</p>
+
+<table align="center">
+  <tr>
+    <th>FIM Proxy tab (Windows)</th>
+    <th>Log tab (Linux)</th>
+  </tr>
+  <tr>
+    <td valign="top"><img src="docs/screenshots/fim-proxy-tab.png" width="460"
+        alt="FIM Proxy tab: process status, proxy executable, config and workspace paths, ghost-text and sampling settings"></td>
+    <td valign="top"><img src="docs/screenshots/log-tab.png" width="350"
+        alt="Log tab on Linux: llama-server starting in router mode and listing available models, with Clear, Copy All and Auto-scroll controls"></td>
+  </tr>
+</table>
+
 Three tabs:
 
 - **Server** — profiles, launch options, router controls, Hugging Face
