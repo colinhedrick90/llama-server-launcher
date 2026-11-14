@@ -4,7 +4,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import launcher_core
 from launcher_core import (
     DEFAULT_PROFILE,
     ManagedServer,
@@ -13,7 +15,13 @@ from launcher_core import (
     build_hf_cache_remove_command,
     build_hf_download_command,
     build_server_command,
+    default_model_root,
+    default_settings_path,
     discover_models,
+    fim_ext_config_load,
+    fim_ext_config_save,
+    fim_retrieval_enabled_get,
+    fim_retrieval_enabled_set,
     model_download_dir,
     normalize_repo_id,
     parse_extra_args,
@@ -39,7 +47,7 @@ class HfDownloadTests(unittest.TestCase):
 
     def test_model_download_dir_uses_repo_name_under_root(self):
         self.assertEqual(
-            r"C:\localai\GLM-4.6-GGUF",
+            str(default_model_root() / "GLM-4.6-GGUF"),
             model_download_dir("unsloth/GLM-4.6-GGUF"),
         )
         self.assertEqual(
@@ -147,6 +155,17 @@ class CommandTests(unittest.TestCase):
 """
 
         self.assertEqual(["Vulkan0"], parse_devices(output))
+
+    def test_device_parsing_ignores_driver_warnings(self):
+        output = """WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: [Loader Message] Code 0 : ICD for selected physical device does not support
+Available devices:
+  Vulkan0: AMD Ryzen 9 9950X (RADV RAPHAEL_MENDOCINO) (1024 MiB, 512 MiB free)
+  Vulkan1: AMD Radeon AI PRO R9700 (RADV GFX1201) (32624 MiB, 29782 MiB free)
+  Vulkan1: AMD Radeon AI PRO R9700 (RADV GFX1201) (32624 MiB, 29782 MiB free)
+"""
+
+        self.assertEqual(["Vulkan0", "Vulkan1"], parse_devices(output))
 
     def test_builds_expected_llama_server_command(self):
         profile = dict(DEFAULT_PROFILE)
@@ -548,6 +567,70 @@ class ManagedServerTests(unittest.TestCase):
             self.assertFalse(server.running)
         finally:
             server.stop(timeout=1)
+
+
+class PlatformPathTests(unittest.TestCase):
+    def test_default_paths_are_per_user_and_absolute(self):
+        settings = default_settings_path()
+        self.assertEqual("settings.json", settings.name)
+        self.assertEqual("LlamaServerLauncher", settings.parent.name)
+        self.assertTrue(settings.is_absolute())
+        self.assertTrue(default_model_root().is_absolute())
+
+
+class FimConfigTests(unittest.TestCase):
+    def test_retrieval_toggle_rewrites_only_the_enabled_line(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.toml"
+            config.write_text(
+                "# proxy config\n"
+                "[server]\n"
+                "enabled = true  # unrelated key, must not change\n"
+                "\n"
+                "[retrieval]\n"
+                "# semantic retrieval\n"
+                "enabled = true\n"
+                "top_k = 4\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(launcher_core, "FIM_PROXY_CONFIG", str(config)):
+                self.assertTrue(fim_retrieval_enabled_get())
+                fim_retrieval_enabled_set(False)
+                self.assertFalse(fim_retrieval_enabled_get())
+
+            lines = config.read_text(encoding="utf-8").splitlines()
+            self.assertEqual("enabled = true  # unrelated key, must not change", lines[2])
+            self.assertEqual("# semantic retrieval", lines[5])
+            self.assertEqual("enabled = false", lines[6])
+            self.assertEqual("top_k = 4", lines[7])
+
+    def test_retrieval_defaults_to_enabled_when_config_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            missing = str(Path(temp) / "nope.toml")
+            with mock.patch.object(launcher_core, "FIM_PROXY_CONFIG", missing):
+                self.assertTrue(fim_retrieval_enabled_get())
+
+    def test_extension_config_save_merges_into_existing_json(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ext = Path(temp) / "local.fim-ghost-0.1.0"
+            ext.mkdir()
+            config = ext / "fim.config.json"
+            config.write_text(json.dumps({"enabled": True, "keepMe": 1}), encoding="utf-8")
+            pattern = str(Path(temp) / "local.fim-ghost*" / "fim.config.json")
+            with mock.patch.object(launcher_core, "FIM_EXT_CONFIG_GLOB", pattern):
+                saved = fim_ext_config_save({"enabled": False, "nPredict": 32})
+                loaded = fim_ext_config_load()
+
+            self.assertEqual(str(config), saved)
+            self.assertEqual({"enabled": False, "keepMe": 1, "nPredict": 32}, loaded)
+
+    def test_extension_config_missing_reports_cleanly(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pattern = str(Path(temp) / "local.fim-ghost*" / "fim.config.json")
+            with mock.patch.object(launcher_core, "FIM_EXT_CONFIG_GLOB", pattern):
+                self.assertEqual({}, fim_ext_config_load())
+                with self.assertRaises(RuntimeError):
+                    fim_ext_config_save({"enabled": True})
 
 
 if __name__ == "__main__":

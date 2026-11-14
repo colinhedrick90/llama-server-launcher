@@ -3,6 +3,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -61,8 +62,21 @@ class ModelInfo:
         return f"{self.name} ({self.size_gib:.2f} GiB)"
 
 
+IS_WINDOWS = os.name == "nt"
+
+
+def default_model_root() -> Path:
+    """Where GGUFs live by default. C:\\localai on Windows, ~/models on Linux."""
+    if IS_WINDOWS:
+        return Path(r"C:\localai")
+    return Path.home() / "models"
+
+
 def default_settings_path() -> Path:
-    base = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    if IS_WINDOWS:
+        base = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config"))
     return base / "LlamaServerLauncher" / "settings.json"
 
 
@@ -71,9 +85,9 @@ def huggingface_cache_path() -> Path:
 
 
 def default_hf_cache_dir() -> str:
-    localai = Path(r"C:\localai")
-    if localai.exists():
-        return str(localai)
+    root = default_model_root()
+    if root.exists():
+        return str(root)
     hf_home = os.getenv("HF_HOME")
     if hf_home:
         return hf_home
@@ -103,12 +117,24 @@ def discover_models(roots: Iterable[Path | str]) -> list[ModelInfo]:
     return sorted(found.values(), key=lambda item: (item.name.casefold(), item.path.casefold()))
 
 
+_DEVICE_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z0-9_]*\d+)\s*:")
+
+
 def parse_devices(output: str) -> list[str]:
+    """Pull backend device ids (Vulkan0, CUDA1, ROCm0, ...) out of --list-devices.
+
+    Must not match on "contains a colon" alone: RADV prints warnings such as
+    'WARNING: radv is not a conformant Vulkan implementation' and
+    'WARNING: [Loader Message] Code 0 : ICD for selected physical device...'
+    which would otherwise show up as phantom devices named WARNING.
+    """
     devices = []
     for line in output.splitlines():
-        stripped = line.strip()
-        if ":" in stripped and not stripped.lower().startswith("available devices"):
-            devices.append(stripped.split(":", 1)[0].strip())
+        match = _DEVICE_RE.match(line.strip())
+        if match:
+            name = match.group("name")
+            if name not in devices:
+                devices.append(name)
     return devices
 
 
@@ -139,7 +165,7 @@ def parse_extra_args(extra: str) -> list[str]:
     return args
 
 
-DEFAULT_DOWNLOAD_ROOT = r"C:\localai"
+DEFAULT_DOWNLOAD_ROOT = str(default_model_root())
 _HF_API_BASE = "https://huggingface.co"
 # Auxiliary GGUFs that belong with a model regardless of quant choice:
 # multimodal projectors (mmproj-*.gguf) and MTP/draft weights (*mtp*.gguf).
@@ -602,7 +628,7 @@ def unload_router_model(host: str, port, model_id: str, timeout: float = 30.0) -
         raise last_error
 
 
-def dedicated_gpu_memory_gib(pid: int) -> float | None:
+def _dedicated_gpu_memory_gib_windows(pid: int) -> float | None:
     script = (
         "$c=Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' -ErrorAction SilentlyContinue;"
         f"$s=$c.CounterSamples|Where-Object{{$_.InstanceName -match 'pid_{pid}_'}}|"
@@ -620,6 +646,55 @@ def dedicated_gpu_memory_gib(pid: int) -> float | None:
         return float(result.stdout.strip() or 0)
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+def _dedicated_gpu_memory_gib_linux(pid: int) -> float | None:
+    """Sum VRAM for a pid from amdgpu's DRM fdinfo.
+
+    The kernel exposes per-client VRAM under /proc/<pid>/fdinfo/<fd> as
+    'drm-memory-vram: <n> KiB'. A process holds several fds against the same
+    DRM client, so dedupe on drm-client-id or the total comes out multiplied.
+    Works for any DRM driver that reports the standard keys, not just amdgpu.
+    """
+    fdinfo_dir = Path("/proc") / str(pid) / "fdinfo"
+    if not fdinfo_dir.is_dir():
+        return None
+    per_client: dict[str, int] = {}
+    try:
+        for entry in fdinfo_dir.iterdir():
+            try:
+                text = entry.read_text(errors="replace")
+            except OSError:
+                continue
+            if "drm-memory-vram" not in text:
+                continue
+            client_id = ""
+            vram_kib = 0
+            for line in text.splitlines():
+                key, _, value = line.partition(":")
+                key = key.strip()
+                value = value.strip()
+                if key == "drm-client-id":
+                    client_id = value
+                elif key == "drm-memory-vram":
+                    number = value.split()[0] if value.split() else "0"
+                    try:
+                        vram_kib = int(number)
+                    except ValueError:
+                        vram_kib = 0
+            key_name = client_id or entry.name
+            per_client[key_name] = max(per_client.get(key_name, 0), vram_kib)
+    except OSError:
+        return None
+    if not per_client:
+        return 0.0
+    return round(sum(per_client.values()) / (1024 * 1024), 2)
+
+
+def dedicated_gpu_memory_gib(pid: int) -> float | None:
+    if IS_WINDOWS:
+        return _dedicated_gpu_memory_gib_windows(pid)
+    return _dedicated_gpu_memory_gib_linux(pid)
 
 
 class SettingsStore:
@@ -734,7 +809,14 @@ class ManagedServer:
 
 FIM_PROXY_TASK = "llama-fim-context-proxy"
 FIM_PROXY_HEALTH_URL = "http://127.0.0.1:8012/health"
-FIM_PROXY_CONFIG = r"C:\Users\colin\llama-fim-context-proxy\config.toml"
+FIM_PROXY_CONFIG = str(Path.home() / "llama-fim-context-proxy" / "config.toml")
+
+# The FIM proxy is driven by a Windows Scheduled Task so it outlives this app
+# and VS Code reloads. There is no equivalent wired up on Linux yet -- the
+# natural port is a systemd --user unit. Until that exists, these helpers report
+# "Unavailable" rather than raising FileNotFoundError on a missing powershell.
+FIM_PROXY_SUPPORTED = IS_WINDOWS
+_FIM_UNSUPPORTED_MSG = "FIM proxy control is Windows-only for now (needs a systemd --user unit on Linux)."
 
 
 def _run_powershell(script: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
@@ -758,7 +840,9 @@ def _run_powershell(script: str, timeout: int = 60) -> subprocess.CompletedProce
 
 
 def fim_proxy_task_state() -> str:
-    """Ready / Running / Disabled / Missing."""
+    """Ready / Running / Disabled / Missing / Unavailable."""
+    if not FIM_PROXY_SUPPORTED:
+        return "Unavailable"
     result = _run_powershell(
         f"$t = Get-ScheduledTask -TaskName '{FIM_PROXY_TASK}' -ErrorAction SilentlyContinue; "
         "if ($t) { $t.State } else { 'Missing' }",
@@ -791,6 +875,8 @@ def fim_proxy_status() -> dict:
 
 
 def fim_proxy_start() -> str:
+    if not FIM_PROXY_SUPPORTED:
+        raise RuntimeError(_FIM_UNSUPPORTED_MSG)
     if fim_proxy_task_state() == "Missing":
         raise RuntimeError(
             f"Scheduled task '{FIM_PROXY_TASK}' is not registered. "
@@ -809,6 +895,8 @@ def fim_proxy_stop() -> str:
     fall back to killing whatever owns the port. The proxy puts its llama-server
     backend in a kill-on-close job object, so the backend dies with it.
     """
+    if not FIM_PROXY_SUPPORTED:
+        raise RuntimeError(_FIM_UNSUPPORTED_MSG)
     _run_powershell(f"Stop-ScheduledTask -TaskName '{FIM_PROXY_TASK}' -ErrorAction SilentlyContinue")
     result = _run_powershell(
         "$c = Get-NetTCPConnection -State Listen -LocalPort 8012 -ErrorAction SilentlyContinue; "

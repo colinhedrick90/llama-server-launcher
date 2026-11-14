@@ -15,11 +15,13 @@ from launcher_core import (
     DEFAULT_PROFILE,
     FIM_PROXY_CONFIG,
     FIM_PROXY_HEALTH_URL,
+    IS_WINDOWS,
     ROUTER_LOADED_STATUSES,
     ManagedServer,
     SettingsStore,
     build_server_command,
     default_hf_cache_dir,
+    default_model_root,
     discover_models,
     fim_ext_config_load,
     fim_ext_config_save,
@@ -45,6 +47,10 @@ from launcher_core import (
     validate_profile,
 )
 
+
+# "monospace" is a fontconfig alias; Windows Tk has no such family and silently
+# falls back to a proportional font, and Consolas does not exist on Linux.
+MONO_FONT = ("Consolas" if IS_WINDOWS else "monospace", 9)
 
 class _Tooltip:
     """Minimal hover tooltip — Tkinter ships none."""
@@ -180,21 +186,64 @@ class LauncherApp:
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
 
-        # Tabs hold the per-service controls; the log below is shared by both.
+        # Every pane is a tab, including the log. The log used to sit below the
+        # notebook sharing vertical space with the Server controls, which pushed
+        # the lower Server rows off screen on shorter displays.
         notebook = ttk.Notebook(outer)
         notebook.grid(row=0, column=0, columnspan=2, sticky="nsew")
         outer.rowconfigure(0, weight=1)
 
-        server_tab = ttk.Frame(notebook, padding=8)
+        # --- Server tab, inside a scrollable canvas -------------------------
+        # The Server tab is tall (profile + config + router + download + cache +
+        # loaded-models). Scrolling means it degrades gracefully instead of
+        # clipping whatever sits at the bottom.
+        server_outer = ttk.Frame(notebook)
+        notebook.add(server_outer, text="Server")
+        server_outer.rowconfigure(0, weight=1)
+        server_outer.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(server_outer, highlightthickness=0, borderwidth=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vbar = ttk.Scrollbar(server_outer, orient="vertical", command=canvas.yview)
+        vbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vbar.set)
+
+        server_tab = ttk.Frame(canvas, padding=8)
         server_tab.columnconfigure(1, weight=1)
-        notebook.add(server_tab, text="Server")
+        window = canvas.create_window((0, 0), window=server_tab, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _stretch_inner(event):
+            # Keep the inner frame as wide as the canvas so widgets fill it.
+            canvas.itemconfigure(window, width=event.width)
+
+        server_tab.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _stretch_inner)
+
+        def _wheel(event):
+            # Windows/macOS send <MouseWheel> with a delta; X11 sends Button-4/5.
+            if getattr(event, "num", None) == 4:
+                delta = -1
+            elif getattr(event, "num", None) == 5:
+                delta = 1
+            else:
+                delta = -1 if event.delta > 0 else 1
+            canvas.yview_scroll(delta, "units")
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            canvas.bind_all(seq, lambda e: _wheel(e) if self._pointer_over(canvas) else None)
 
         fim_tab = ttk.Frame(notebook, padding=8)
         fim_tab.columnconfigure(1, weight=1)
         notebook.add(fim_tab, text="FIM Proxy")
         self._build_fim_tab(fim_tab)
 
-        shell = outer       # real container - the shared log lives here, below the tabs
+        log_tab = ttk.Frame(notebook, padding=8)
+        notebook.add(log_tab, text="Log")
+        self._build_log_tab(log_tab)
+
         outer = server_tab  # existing rows below are laid out inside the Server tab
 
         profiles = ttk.LabelFrame(outer, text="Profile", padding=8)
@@ -337,7 +386,7 @@ class LauncherApp:
 
         row += 1
         ttk.Label(config, text="Additional arguments").grid(row=row, column=0, sticky="w", pady=3)
-        self.extra_args_text = tk.Text(config, height=4, wrap="none", font=("Consolas", 9))
+        self.extra_args_text = tk.Text(config, height=4, wrap="none", font=MONO_FONT)
         self.extra_args_text.grid(
             row=row, column=1, columnspan=3, sticky="ew", padx=6, pady=3
         )
@@ -372,7 +421,7 @@ class LauncherApp:
             height=6,
             selectmode="extended",
             exportselection=False,
-            font=("Consolas", 9),
+            font=MONO_FONT,
         )
         self.hf_files_list.grid(row=0, column=0, sticky="ew")
         files_scroll = ttk.Scrollbar(files_frame, command=self.hf_files_list.yview)
@@ -431,16 +480,48 @@ class LauncherApp:
         ttk.Button(controls, text="Restart Server", command=self.restart_server).pack(side="left")
         ttk.Label(controls, textvariable=self.status).pack(side="right", padx=8)
 
-        logs = ttk.LabelFrame(shell, text="Log", padding=4)
-        logs.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(8, 0))
-        shell.rowconfigure(1, weight=1)
-        logs.rowconfigure(0, weight=1)
-        logs.columnconfigure(0, weight=1)
-        self.log_text = tk.Text(logs, wrap="none", height=16, state="disabled", font=("Consolas", 9))
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(logs, command=self.log_text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scroll.set)
+    def _pointer_over(self, widget) -> bool:
+        """True when the mouse is inside widget - scopes the global wheel bind."""
+        try:
+            x, y = widget.winfo_pointerxy()
+            return str(widget.winfo_containing(x, y)).startswith(str(widget))
+        except (tk.TclError, KeyError):
+            return False
+
+    def _build_log_tab(self, parent) -> None:
+        """Server log on its own tab.
+
+        Previously this shared the window with the Server controls, so both were
+        cramped. On its own tab it gets the full height, and the Server tab stops
+        being clipped.
+        """
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        bar = ttk.Frame(parent)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Button(bar, text="Clear", command=self.clear_log).pack(side="left")
+        ttk.Button(bar, text="Copy All", command=self.copy_log).pack(side="left", padx=6)
+        self.log_autoscroll = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Auto-scroll", variable=self.log_autoscroll).pack(side="left", padx=6)
+
+        self.log_text = tk.Text(parent, wrap="none", height=30, state="disabled",
+                                font=MONO_FONT)
+        self.log_text.grid(row=1, column=0, sticky="nsew")
+        vscroll = ttk.Scrollbar(parent, orient="vertical", command=self.log_text.yview)
+        vscroll.grid(row=1, column=1, sticky="ns")
+        hscroll = ttk.Scrollbar(parent, orient="horizontal", command=self.log_text.xview)
+        hscroll.grid(row=2, column=0, sticky="ew")
+        self.log_text.configure(yscrollcommand=vscroll.set, xscrollcommand=hscroll.set)
+
+    def clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+    def copy_log(self) -> None:
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.log_text.get("1.0", "end-1c"))
 
     def _build_fim_tab(self, parent) -> None:
         """Start/stop the FIM context proxy.
@@ -844,7 +925,13 @@ class LauncherApp:
         self.save_profile()
 
     def browse_server(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All files", "*.*")])
+        path = filedialog.askopenfilename(
+            filetypes=(
+                [("Executable", "*.exe"), ("All files", "*.*")]
+                if IS_WINDOWS
+                else [("All files", "*.*")]
+            )
+        )
         if path:
             self.server_path.set(path)
             self.refresh_devices()
@@ -856,20 +943,20 @@ class LauncherApp:
             self.scan_models()
 
     def browse_models_dir(self) -> None:
-        path = filedialog.askdirectory(initialdir=self.models_dir.get() or r"C:\localai")
+        path = filedialog.askdirectory(initialdir=self.models_dir.get() or str(default_model_root()))
         if path:
             self.models_dir.set(path)
 
     def browse_models_preset(self) -> None:
         path = filedialog.askopenfilename(
-            initialdir=self.models_dir.get() or r"C:\localai",
+            initialdir=self.models_dir.get() or str(default_model_root()),
             filetypes=[("INI files", "*.ini"), ("All files", "*.*")],
         )
         if path:
             self.models_preset.set(path)
 
     def browse_hf_cache_dir(self) -> None:
-        path = filedialog.askdirectory(initialdir=self.hf_cache_dir.get() or r"C:\localai")
+        path = filedialog.askdirectory(initialdir=self.hf_cache_dir.get() or str(default_model_root()))
         if path:
             self.hf_cache_dir.set(path)
             self.refresh_hf_cache_models()
@@ -1225,7 +1312,7 @@ class LauncherApp:
                 capture_output=True,
                 text=True,
                 timeout=15,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             self._append_log(f"[launcher] opencode sync failed: {exc}")
@@ -1245,7 +1332,10 @@ class LauncherApp:
     def _append_log(self, line: str) -> None:
         self.log_text.configure(state="normal")
         self.log_text.insert("end", line + "\n")
-        self.log_text.see("end")
+        # Only follow the tail when auto-scroll is on, so scrolling back to read
+        # something is not yanked away by the next line of server output.
+        if getattr(self, "log_autoscroll", None) is None or self.log_autoscroll.get():
+            self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
     def _poll(self) -> None:

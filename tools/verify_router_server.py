@@ -9,6 +9,7 @@ from launcher_core import (
     DEFAULT_PROFILE,
     ManagedServer,
     build_server_command,
+    default_model_root,
     find_llama_server,
     is_port_available,
     validate_profile,
@@ -19,7 +20,7 @@ def main() -> None:
     profile = {
         **DEFAULT_PROFILE,
         "mode": "router",
-        "models_dir": r"C:\localai",
+        "models_dir": str(default_model_root()),
         "models_max": 1,
         "models_autoload": False,
         "port": 18086,
