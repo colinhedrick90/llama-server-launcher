@@ -23,6 +23,7 @@ server.pfx
 # Machine-specific helper scripts (hold hosts/credentials for one LAN)
 ssh-helper.ps1
 install-cert-remote.py
+generate-cert.ps1
 
 # Local tool/editor state
 .claude/
