@@ -9,18 +9,13 @@ Windows and Linux.
        alt="Server tab on Windows: profile selector, server configuration, router mode, Hugging Face download, cache removal, and loaded-model controls">
 </p>
 
-<table align="center">
-  <tr>
-    <th>FIM Proxy tab (Windows)</th>
-    <th>Log tab (Linux)</th>
-  </tr>
-  <tr>
-    <td valign="top"><img src="docs/screenshots/fim-proxy-tab.png" width="460"
-        alt="FIM Proxy tab: process status, proxy executable, config and workspace paths, ghost-text and sampling settings"></td>
-    <td valign="top"><img src="docs/screenshots/log-tab.png" width="350"
-        alt="Log tab on Linux: llama-server starting in router mode and listing available models, with Clear, Copy All and Auto-scroll controls"></td>
-  </tr>
-</table>
+<p align="center">
+  <img src="docs/screenshots/fim-proxy-tab.png" width="54%"
+       alt="FIM Proxy tab on Windows: process status, proxy executable, config and workspace paths, ghost-text and sampling settings">
+  <img src="docs/screenshots/log-tab.png" width="41%"
+       alt="Log tab on Linux: llama-server starting in router mode and listing available models, with Clear, Copy All and Auto-scroll controls">
+</p>
+<p align="center"><sub>Top: Server tab (Windows). Bottom: FIM Proxy tab (Windows) and Log tab (Linux).</sub></p>
 
 Three tabs:
 
