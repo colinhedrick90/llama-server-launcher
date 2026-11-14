@@ -1122,7 +1122,7 @@ class LauncherApp:
             try:
                 models = list_hf_cache_models(cache_dir)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                self.root.after(0, lambda: messagebox.showerror("HF cache scan failed", str(exc)))
+                self.root.after(0, lambda text=str(exc): messagebox.showerror("HF cache scan failed", text))
                 return
             self.root.after(0, lambda: self._set_hf_cache_models(models))
 
@@ -1170,7 +1170,7 @@ class LauncherApp:
             try:
                 output = run_hf_cache_remove(cache_dir, repo_id, dry_run=dry_run)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                self.root.after(0, lambda: messagebox.showerror("HF cache removal failed", str(exc)))
+                self.root.after(0, lambda text=str(exc): messagebox.showerror("HF cache removal failed", text))
                 return
 
             def done() -> None:
@@ -1207,7 +1207,7 @@ class LauncherApp:
             try:
                 files = list_repo_gguf_files(repo)
             except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("Listing failed", str(exc)))
+                self.root.after(0, lambda text=str(exc): messagebox.showerror("Listing failed", text))
                 return
             self.root.after(0, lambda: self._set_hf_repo_files(files))
 
@@ -1277,7 +1277,7 @@ class LauncherApp:
             try:
                 code = run_hf_download(repo, selected, local_dir, self.log_queue.put)
             except Exception as exc:
-                self.root.after(0, lambda: messagebox.showerror("Download failed", str(exc)))
+                self.root.after(0, lambda text=str(exc): messagebox.showerror("Download failed", text))
                 code = -1
             def done() -> None:
                 self.hf_download_running = False
@@ -1310,7 +1310,7 @@ class LauncherApp:
             try:
                 models = list_router_models(host, port)
             except (OSError, ValueError) as exc:
-                self.root.after(0, lambda: messagebox.showerror("Query failed", str(exc)))
+                self.root.after(0, lambda text=str(exc): messagebox.showerror("Query failed", text))
                 return
             self.root.after(0, lambda: self._set_loaded_models(models))
 
@@ -1351,7 +1351,7 @@ class LauncherApp:
             try:
                 model_ids = router_loaded_models(host, port)
             except (OSError, ValueError) as exc:
-                self.root.after(0, lambda: messagebox.showerror("Query failed", str(exc)))
+                self.root.after(0, lambda text=str(exc): messagebox.showerror("Query failed", text))
                 return
             self.root.after(0, lambda: self._unload_models(model_ids))
 
