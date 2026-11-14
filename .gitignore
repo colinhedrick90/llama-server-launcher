@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+.venv*/
+venv/
+
+# Build output (PyInstaller)
+build/
+dist/
+*.spec
+*.exe
+*.exe.bak-*
+/LlamaServerLauncher
+assets/*.ico
+
+# Local TLS material - never commit
+server.crt
+server.key
+server.pfx
+*.pem
+*.p12
+
+# Machine-specific helper scripts (hold hosts/credentials for one LAN)
+ssh-helper.ps1
+install-cert-remote.py
+
+# Local tool/editor state
+.claude/
+.vscode/
+.idea/
+
+# Local settings/config overrides
+settings.json
+*.local.json
+.env
+.env.*

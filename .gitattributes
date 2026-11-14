@@ -1,0 +1,4 @@
+# Same bytes on Windows and Linux checkouts.
+* text=auto eol=lf
+*.ico binary
+*.png binary
