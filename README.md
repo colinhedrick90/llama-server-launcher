@@ -41,8 +41,9 @@ user at runtime, and everything you configure is saved locally:
 | Settings | `%LOCALAPPDATA%\LlamaServerLauncher\settings.json` | `$XDG_CONFIG_HOME/LlamaServerLauncher/settings.json` (default `~/.config`) |
 | Model root | `C:\localai` | `~/models` |
 | VRAM readout | PowerShell GPU performance counter | DRM fdinfo under `/proc/<pid>/fdinfo` |
-| FIM proxy control | Scheduled Task `llama-fim-context-proxy` | not wired up yet (reports *Unavailable*) |
+| FIM proxy control | launcher starts/stops the proxy process directly | same |
 | FIM proxy config | any path — default `~/llama-fim-context-proxy/config.toml` | same |
+| FIM proxy output | `%LOCALAPPDATA%\LlamaServerLauncher\fim-proxy.log` | `~/.config/LlamaServerLauncher/fim-proxy.log` |
 
 Secrets are never written to profiles by the launcher itself:
 
@@ -98,14 +99,31 @@ more entries than the preset defines.
 
 ## FIM Proxy tab
 
-**Start / Stop / Restart Proxy** drive the `llama-fim-context-proxy` Scheduled
-Task on Windows. On Linux those buttons report *Unavailable* until a
-`systemd --user` unit is wired up. Start the proxy, then start your editor, and
-it survives editor reloads.
+**Start / Stop / Restart Proxy** launch and stop `fim-context-proxy` directly,
+the same way on Windows and Linux. Nothing is registered with the OS — no
+scheduled task, no systemd unit. The proxy runs detached, so it survives editor
+reloads and keeps running if you close the launcher. Start the proxy, then
+start your editor.
 
-**Config** is the proxy's `config.toml`. Type a path or **Browse** to it
-wherever it lives; **Refresh** re-reads it. The choice is remembered in your
-local `settings.json`.
+Three path rows say what to launch. Type a path or **Browse**; all three are
+remembered in your local `settings.json`:
+
+- **Proxy executable** — the `fim-context-proxy` binary. Left blank, it is
+  detected in the `.venv` beside the config file, then on `PATH`. **Refresh**
+  re-detects it.
+- **Config** — the proxy's `config.toml`, wherever it lives. Passed as
+  `--config`; the endpoint shown above is read from its `[server]` section.
+  **Refresh** re-reads it.
+- **Workspace** — the folder the proxy indexes, passed as `--workspace`. Blank
+  uses the proxy's own folder.
+
+**Process** shows whether something is listening on the proxy's port and its
+pid. Start is refused while the port is in use, so two copies never compete.
+Stop ends whichever proxy holds the port — including one started outside the
+launcher — but first checks that the process really is the proxy and leaves any
+other program alone. Proxy output goes to `fim-proxy.log` next to
+`settings.json`; if the proxy exits straight away, the error dialog shows the
+tail of that log.
 
 The settings below the controls work on both platforms:
 

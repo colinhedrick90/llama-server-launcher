@@ -708,6 +708,8 @@ class SettingsStore:
             "custom_model_folder": "",
             "hf_cache_dir": default_hf_cache_dir(),
             "fim_proxy_config": FIM_PROXY_CONFIG,
+            "fim_proxy_executable": "",
+            "fim_proxy_workspace": "",
             "selected_profile": "Default",
             "profiles": {"Default": dict(DEFAULT_PROFILE)},
         }
@@ -803,72 +805,193 @@ class ManagedServer:
 
 # --- FIM context proxy -------------------------------------------------------
 #
-# The proxy runs as a Windows scheduled task (registered at logon) rather than as
-# a child of this app or of a VS Code terminal, so it survives window reloads.
-# These helpers drive that task; they never spawn the proxy directly, which would
-# leave a second copy fighting for port 8012.
+# The launcher starts the proxy itself, as a detached process: it is not a child
+# of an editor terminal, so editor reloads do not take it down, and it keeps
+# running if the launcher is closed. Nothing is registered with the OS (no
+# scheduled task, no systemd unit); the same code path works on Windows and
+# Linux. A start is refused while the proxy port is already held, so two copies
+# never fight for it.
 
-FIM_PROXY_TASK = "llama-fim-context-proxy"
-FIM_PROXY_HEALTH_URL = "http://127.0.0.1:8012/health"
+FIM_PROXY_DEFAULT_HOST = "127.0.0.1"
+FIM_PROXY_DEFAULT_PORT = 8012
+FIM_PROXY_HEALTH_URL = f"http://{FIM_PROXY_DEFAULT_HOST}:{FIM_PROXY_DEFAULT_PORT}/health"
 # Default location only. The config can live anywhere; the UI lets the user
 # browse to it and the choice is stored in settings.json ("fim_proxy_config").
 FIM_PROXY_CONFIG = str(Path.home() / "llama-fim-context-proxy" / "config.toml")
+FIM_PROXY_EXECUTABLE_NAME = "fim-context-proxy"
+# Substrings that identify the proxy in a process command line, whichever way
+# it was started (console script or `python -m fim_context_proxy`).
+_FIM_PROXY_MARKERS = ("fim-context-proxy", "fim_context_proxy")
 
-# The FIM proxy is driven by a Windows Scheduled Task so it outlives this app
-# and VS Code reloads. There is no equivalent wired up on Linux yet -- the
-# natural port is a systemd --user unit. Until that exists, these helpers report
-# "Unavailable" rather than raising FileNotFoundError on a missing powershell.
-FIM_PROXY_SUPPORTED = IS_WINDOWS
-_FIM_UNSUPPORTED_MSG = "FIM proxy control is Windows-only for now (needs a systemd --user unit on Linux)."
+# Popen handle of a proxy started by this process, kept so it can be reaped.
+_fim_proxy_process: subprocess.Popen | None = None
 
 
 def _run_powershell(script: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
     """Run a PowerShell snippet.
 
     Separate from _run_cli_command because that helper single-quotes every
-    argument, which turns cmdlet parameter names like -TaskName into positional
-    strings.
+    argument, which turns cmdlet parameter names into positional strings.
     """
-    env = os.environ.copy()
-    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
-        env.pop(name, None)
     return subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=env,
+        env=_child_env(),
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
-def fim_proxy_task_state() -> str:
-    """Ready / Running / Disabled / Missing / Unavailable."""
-    if not FIM_PROXY_SUPPORTED:
-        return "Unavailable"
-    result = _run_powershell(
-        f"$t = Get-ScheduledTask -TaskName '{FIM_PROXY_TASK}' -ErrorAction SilentlyContinue; "
-        "if ($t) { $t.State } else { 'Missing' }",
-        timeout=20,
-    )
-    state = (result.stdout or "").strip().splitlines()
-    return state[-1].strip() if state else "Unknown"
+def _child_env() -> dict:
+    """Environment for child processes, without this app's own Python settings.
+
+    A PyInstaller build points PYTHONHOME (and, on Linux, LD_LIBRARY_PATH) at
+    its unpacked bundle; a child Python would otherwise pick those up.
+    """
+    env = os.environ.copy()
+    for name in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE", "__PYVENV_LAUNCHER__"):
+        env.pop(name, None)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        env["LD_LIBRARY_PATH"] = env.pop("LD_LIBRARY_PATH_ORIG")
+    return env
 
 
-def fim_proxy_health(timeout: float = 2.0) -> dict:
+def fim_proxy_endpoint(config_path: str | None = None) -> tuple[str, int]:
+    """(host, port) the proxy listens on, from [server] in its config.toml."""
+    host, port = FIM_PROXY_DEFAULT_HOST, FIM_PROXY_DEFAULT_PORT
+    try:
+        import tomllib
+
+        with open(fim_proxy_config_path(config_path), "rb") as handle:
+            server = tomllib.load(handle).get("server", {})
+        host = str(server.get("host") or host)
+        port = int(server.get("port") or port)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return _client_host(host), port
+
+
+def fim_proxy_base_url(config_path: str | None = None) -> str:
+    host, port = fim_proxy_endpoint(config_path)
+    return f"http://{host}:{port}"
+
+
+def fim_proxy_log_path() -> Path:
+    """Where a launcher-started proxy writes its output."""
+    return default_settings_path().parent / "fim-proxy.log"
+
+
+def find_fim_proxy_executable(config_path: str | None = None) -> str:
+    """Best guess at the proxy executable; "" when it cannot be found.
+
+    Looks in the virtual environment beside the config file first (the usual
+    `uv sync` / `pip install -e .` layout), then on PATH.
+    """
+    project = Path(fim_proxy_config_path(config_path)).parent
+    name = FIM_PROXY_EXECUTABLE_NAME + (".exe" if IS_WINDOWS else "")
+    bin_dir = "Scripts" if IS_WINDOWS else "bin"
+    for venv in (".venv", "venv"):
+        candidate = project / venv / bin_dir / name
+        if candidate.is_file():
+            return str(candidate)
+    found = shutil.which(FIM_PROXY_EXECUTABLE_NAME)
+    return str(Path(found).resolve()) if found else ""
+
+
+def build_fim_proxy_command(executable: str, config_path: str, workspace: str = "") -> list[str]:
+    command = [str(executable), "--config", str(config_path)]
+    if (workspace or "").strip():
+        command += ["--workspace", str(Path(workspace.strip()).expanduser())]
+    return command
+
+
+def _looks_like_fim_proxy(command_line: str) -> bool:
+    lowered = (command_line or "").casefold()
+    return any(marker in lowered for marker in _FIM_PROXY_MARKERS)
+
+
+def _listening_process(port: int) -> tuple[int, str] | None:
+    """(pid, command line) of whatever is listening on a local TCP port."""
+    port = int(port)
+    if IS_WINDOWS:
+        result = _run_powershell(
+            f"$c = Get-NetTCPConnection -State Listen -LocalPort {port} -ErrorAction SilentlyContinue "
+            "| Select-Object -First 1; "
+            "if ($c) { $p = [int]$c.OwningProcess; "
+            "$w = Get-CimInstance Win32_Process -Filter \"ProcessId=$p\" -ErrorAction SilentlyContinue; "
+            "\"$p|$($w.CommandLine)\" }",
+            timeout=30,
+        )
+        for line in (result.stdout or "").splitlines():
+            pid_text, _, command_line = line.strip().partition("|")
+            if pid_text.isdigit():
+                return int(pid_text), command_line
+        return None
+    try:
+        result = subprocess.run(
+            ["ss", "-H", "-ltnp", f"sport = :{port}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"pid=(\d+)", result.stdout or "")
+    if not match:
+        return None
+    pid = int(match.group(1))
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        command_line = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        command_line = ""
+    return pid, command_line
+
+
+def _port_is_listening(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def fim_proxy_health(config_path: str | None = None, timeout: float = 2.0) -> dict:
     """Probe /health. Returns {} when the proxy is not answering."""
     try:
-        with urllib.request.urlopen(FIM_PROXY_HEALTH_URL, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8", "replace"))
+        url = fim_proxy_base_url(config_path) + "/health"
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+        return data if isinstance(data, dict) else {}
     except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError):
         return {}
 
 
-def fim_proxy_status() -> dict:
-    """Combined task + health view for the UI."""
-    health = fim_proxy_health()
+def fim_proxy_status(config_path: str | None = None) -> dict:
+    """Combined process + health view for the UI."""
+    global _fim_proxy_process
+    if _fim_proxy_process is not None and _fim_proxy_process.poll() is not None:
+        _fim_proxy_process = None  # reaped
+    host, port = fim_proxy_endpoint(config_path)
+    # A plain TCP connect answers "is anything there" in milliseconds; only when
+    # something is do we pay for /health and for asking the OS who owns the port
+    # (a hung proxy still accepts connections, so it is not mistaken for stopped).
+    listening = _port_is_listening(host, port)
+    health = fim_proxy_health(config_path) if listening else {}
+    owner = _listening_process(port) if listening else None
+    started = _fim_proxy_process
+    if owner is None and started is not None:
+        process_state = f"Starting (pid {started.pid})"  # launched, not listening yet
+    elif owner is None:
+        process_state = "Stopped"
+    elif _looks_like_fim_proxy(owner[1]):
+        process_state = f"Running (pid {owner[0]})"
+    else:
+        process_state = f"Port {port} is in use by another program (pid {owner[0]})"
     return {
-        "task_state": fim_proxy_task_state(),
+        "process_state": process_state,
+        "endpoint": f"http://{host}:{port}",
         "listening": bool(health),
         "backend": health.get("backend", ""),
         "backend_mode": health.get("backend_mode", ""),
@@ -877,45 +1000,160 @@ def fim_proxy_status() -> dict:
     }
 
 
-def fim_proxy_start() -> str:
-    if not FIM_PROXY_SUPPORTED:
-        raise RuntimeError(_FIM_UNSUPPORTED_MSG)
-    if fim_proxy_task_state() == "Missing":
+def _tail(path: Path, lines: int = 12) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def fim_proxy_start(
+    executable: str = "", config_path: str | None = None, workspace: str = ""
+) -> str:
+    """Start the proxy detached from this app. Raises RuntimeError with a
+    user-facing reason when it cannot be started."""
+    global _fim_proxy_process
+    config = fim_proxy_config_path(config_path)
+    if not Path(config).is_file():
+        raise RuntimeError(f"Proxy config not found:\n{config}\n\nBrowse to your config.toml.")
+    chosen = (executable or "").strip()
+    resolved = str(Path(chosen).expanduser()) if chosen else find_fim_proxy_executable(config)
+    if not resolved or not (Path(resolved).is_file() or shutil.which(resolved)):
         raise RuntimeError(
-            f"Scheduled task '{FIM_PROXY_TASK}' is not registered. "
-            "Register it before starting the proxy from here."
+            f"Could not find the {FIM_PROXY_EXECUTABLE_NAME} executable"
+            + (f":\n{resolved}" if resolved else ".")
+            + "\n\nBrowse to it (usually in the proxy project's .venv)."
         )
-    result = _run_powershell(f"Start-ScheduledTask -TaskName '{FIM_PROXY_TASK}'", timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "").strip() or "Start failed")
-    return "FIM proxy start requested."
+    work = (workspace or "").strip()
+    if work and not Path(work).expanduser().is_dir():
+        raise RuntimeError(f"Workspace folder not found:\n{work}")
+    host, port = fim_proxy_endpoint(config)
+    if _port_is_listening(host, port):
+        raise RuntimeError(
+            f"Port {port} is already in use - the proxy may already be running. "
+            "Use Refresh to check, or Stop Proxy first."
+        )
 
-
-def fim_proxy_stop() -> str:
-    """Stop the task, then reap any proxy still holding 8012.
-
-    Stop-ScheduledTask does not always terminate an already-detached process, so
-    fall back to killing whatever owns the port. The proxy puts its llama-server
-    backend in a kill-on-close job object, so the backend dies with it.
-    """
-    if not FIM_PROXY_SUPPORTED:
-        raise RuntimeError(_FIM_UNSUPPORTED_MSG)
-    _run_powershell(f"Stop-ScheduledTask -TaskName '{FIM_PROXY_TASK}' -ErrorAction SilentlyContinue")
-    result = _run_powershell(
-        "$c = Get-NetTCPConnection -State Listen -LocalPort 8012 -ErrorAction SilentlyContinue; "
-        "if ($c) { Stop-Process -Id $c.OwningProcess -Force -ErrorAction SilentlyContinue; 'killed' } "
-        "else { 'not running' }",
-        timeout=30,
+    command = build_fim_proxy_command(resolved, config, work)
+    log_path = fim_proxy_log_path()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        oversized = log_path.stat().st_size > 5 * 1024 * 1024
+    except OSError:
+        oversized = False
+    detach: dict = (
+        {
+            "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        }
+        if IS_WINDOWS
+        else {"start_new_session": True}
     )
-    lines = (result.stdout or "").strip().splitlines()
-    detail = lines[-1].strip() if lines else "no response"
-    return f"FIM proxy stopped ({detail})."
-
-
-def fim_proxy_restart() -> str:
-    fim_proxy_stop()
+    with open(log_path, "wb" if oversized else "ab") as log:
+        log.write(f"\n--- launcher start: {' '.join(command)}\n".encode("utf-8"))
+        log.flush()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(Path(work).expanduser()) if work else str(Path(config).parent),
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=_child_env(),
+                **detach,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"Could not start the proxy: {exc}") from exc
+    _fim_proxy_process = process
     time.sleep(1.0)
-    fim_proxy_start()
+    code = process.poll()
+    if code is not None:
+        _fim_proxy_process = None
+        detail = _tail(log_path)
+        raise RuntimeError(
+            f"The proxy exited immediately (code {code}).\n\n{detail}\n\nFull log: {log_path}"
+        )
+    return f"FIM proxy starting (pid {process.pid}). Output: {log_path}"
+
+
+def _terminate_pid(pid: int, grace: float = 8.0) -> None:
+    if IS_WINDOWS:
+        # /T takes the proxy's llama-server backend with it; there is no
+        # graceful signal for a windowless detached process.
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)  # lets the proxy stop its backend cleanly
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not (Path("/proc") / str(pid)).exists():
+            return
+        if _fim_proxy_process is not None and _fim_proxy_process.pid == pid:
+            if _fim_proxy_process.poll() is not None:
+                return
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def fim_proxy_stop(config_path: str | None = None) -> str:
+    """Stop whichever proxy holds the configured port.
+
+    Works for a proxy this app started and for one started elsewhere, but only
+    after checking the port owner really is the proxy: another program that
+    happens to use the same port is left alone.
+    """
+    global _fim_proxy_process
+    host, port = fim_proxy_endpoint(config_path)
+    owner = _listening_process(port)
+    if owner is None:
+        started = _fim_proxy_process
+        if started is not None and started.poll() is None:
+            # Still starting up (not listening yet): stop the one we launched.
+            _terminate_pid(started.pid)
+            _fim_proxy_process = None
+            return f"FIM proxy stopped (pid {started.pid})."
+        _fim_proxy_process = None
+        return "FIM proxy was not running."
+    pid, command_line = owner
+    if not _looks_like_fim_proxy(command_line):
+        raise RuntimeError(
+            f"Port {port} is held by another program (pid {pid}), not the FIM proxy. "
+            "It was left running."
+        )
+    _terminate_pid(pid)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and _port_is_listening(host, port, timeout=0.3):
+        time.sleep(0.2)
+    if _fim_proxy_process is not None:
+        try:
+            _fim_proxy_process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+        _fim_proxy_process = None
+    if _port_is_listening(host, port, timeout=0.3):
+        raise RuntimeError(f"The proxy (pid {pid}) did not release port {port}.")
+    return f"FIM proxy stopped (pid {pid})."
+
+
+def fim_proxy_restart(
+    executable: str = "", config_path: str | None = None, workspace: str = ""
+) -> str:
+    fim_proxy_stop(config_path)
+    time.sleep(0.5)
+    fim_proxy_start(executable, config_path, workspace)
     return "FIM proxy restarted."
 
 

@@ -14,7 +14,6 @@ from launcher_core import (
     DEFAULT_DOWNLOAD_ROOT,
     DEFAULT_PROFILE,
     FIM_PROXY_CONFIG,
-    FIM_PROXY_HEALTH_URL,
     IS_WINDOWS,
     ROUTER_LOADED_STATUSES,
     ManagedServer,
@@ -23,8 +22,12 @@ from launcher_core import (
     default_hf_cache_dir,
     default_model_root,
     discover_models,
+    find_fim_proxy_executable,
     fim_ext_config_load,
     fim_ext_config_save,
+    fim_proxy_base_url,
+    fim_proxy_health,
+    fim_proxy_log_path,
     fim_proxy_restart,
     fim_proxy_start,
     fim_proxy_status,
@@ -148,13 +151,18 @@ class LauncherApp:
 
         # FIM context proxy tab
         self.fim_status = tk.StringVar(value="Unknown")
-        self.fim_task_state = tk.StringVar(value="-")
-        self.fim_endpoint = tk.StringVar(value=FIM_PROXY_HEALTH_URL.replace("/health", ""))
+        self.fim_process_state = tk.StringVar(value="-")
         self.fim_backend = tk.StringVar(value="-")
         self.fim_chunks = tk.StringVar(value="-")
         self.fim_config = tk.StringVar(
             value=self.settings.get("fim_proxy_config") or FIM_PROXY_CONFIG
         )
+        self.fim_endpoint = tk.StringVar(value=fim_proxy_base_url(self.fim_config.get()))
+        self.fim_exe = tk.StringVar(
+            value=self.settings.get("fim_proxy_executable")
+            or find_fim_proxy_executable(self.fim_config.get())
+        )
+        self.fim_workspace = tk.StringVar(value=self.settings.get("fim_proxy_workspace") or "")
 
         # fim-ghost extension ghost-text settings (fim.config.json, hot-reloads)
         self.fim_enabled = tk.BooleanVar(value=True)
@@ -528,16 +536,16 @@ class LauncherApp:
     def _build_fim_tab(self, parent) -> None:
         """Start/stop the FIM context proxy.
 
-        The proxy runs as the 'llama-fim-context-proxy' scheduled task so it
-        survives VS Code window reloads; these buttons drive that task rather than
-        spawning it, which would leave two copies fighting for port 8012.
+        The launcher starts the proxy itself as a detached process (see
+        launcher_core.fim_proxy_start), so it survives editor reloads and closing
+        this window. A start is refused while the proxy port is already held.
         """
         info = ttk.LabelFrame(parent, text="llama-fim-context-proxy", padding=8)
         info.grid(row=0, column=0, columnspan=2, sticky="ew")
         info.columnconfigure(1, weight=1)
 
         rows = (
-            ("Scheduled task", self.fim_task_state),
+            ("Process", self.fim_process_state),
             ("Endpoint", self.fim_endpoint),
             ("Backend", self.fim_backend),
             ("Indexed chunks", self.fim_chunks),
@@ -545,11 +553,20 @@ class LauncherApp:
         for index, (label, variable) in enumerate(rows):
             ttk.Label(info, text=label).grid(row=index, column=0, sticky="w", pady=2)
             ttk.Label(info, textvariable=variable).grid(row=index, column=1, sticky="w", padx=8, pady=2)
-        # The proxy's config.toml can live anywhere, so it is a path row like
-        # llama-server on the Server tab: type or Browse, Refresh re-reads it.
-        self._path_row(
-            info, len(rows), "Config", self.fim_config,
+        # What to launch. Path rows like llama-server on the Server tab: type or
+        # Browse, Refresh re-detects / re-reads. All three are saved locally.
+        row = len(rows)
+        row = self._path_row(
+            info, row, "Proxy executable", self.fim_exe,
+            self.browse_fim_exe, self.refresh_fim_exe,
+        )
+        row = self._path_row(
+            info, row, "Config", self.fim_config,
             self.browse_fim_config, self.refresh_fim_config,
+        )
+        self._path_row(
+            info, row, "Workspace", self.fim_workspace,
+            self.browse_fim_workspace, self.refresh_fim_workspace,
         )
 
         controls = ttk.Frame(parent)
@@ -564,10 +581,11 @@ class LauncherApp:
             parent,
             text=(
                 "Start the proxy, then start your editor and it will survive editor "
-                "reloads. Stopping it here also stops the llama-server backend on 8014 "
-                "(kill-on-close job object)."
+                "reloads. Stopping it here also stops its llama-server backend. "
+                "Workspace is the folder the proxy indexes; leave it blank to use the "
+                f"proxy's own folder. Proxy output is written to {fim_proxy_log_path()}."
             ),
-            wraplength=560,
+            wraplength=720,
             justify="left",
             foreground="gray40",
         )
@@ -664,15 +682,66 @@ class LauncherApp:
             self.fim_config.set(path)
             self.refresh_fim_config()
 
+    def _save_fim_launch_settings(self) -> None:
+        self.settings["fim_proxy_config"] = self.fim_config.get().strip() or FIM_PROXY_CONFIG
+        self.settings["fim_proxy_executable"] = self.fim_exe.get().strip()
+        self.settings["fim_proxy_workspace"] = self.fim_workspace.get().strip()
+        self.store.save(self.settings)
+
     def refresh_fim_config(self) -> None:
         """Remember the chosen proxy config and re-read the settings kept in it."""
         path = self.fim_config.get().strip() or FIM_PROXY_CONFIG
         self.fim_config.set(path)
-        self.settings["fim_proxy_config"] = path
-        self.store.save(self.settings)
+        if not self.fim_exe.get().strip():
+            self.fim_exe.set(find_fim_proxy_executable(path))
+        self._save_fim_launch_settings()
+        self.fim_endpoint.set(fim_proxy_base_url(path))
         self.load_fim_settings()
         if not Path(path).expanduser().is_file():
             self.fim_settings_status.set("proxy config not found - check the Config path")
+        self.refresh_fim_status()
+
+    def browse_fim_exe(self) -> None:
+        current = Path(self.fim_exe.get() or self.fim_config.get() or FIM_PROXY_CONFIG).expanduser()
+        path = filedialog.askopenfilename(
+            initialdir=str(current.parent if current.parent.is_dir() else Path.home()),
+            filetypes=(
+                [("Executable", "*.exe"), ("All files", "*.*")]
+                if IS_WINDOWS
+                else [("All files", "*.*")]
+            ),
+        )
+        if path:
+            self.fim_exe.set(path)
+            self._save_fim_launch_settings()
+
+    def refresh_fim_exe(self) -> None:
+        """Re-detect the proxy executable when the box is blank or stale."""
+        current = self.fim_exe.get().strip()
+        if not current or not Path(current).expanduser().is_file():
+            found = find_fim_proxy_executable(self.fim_config.get())
+            self.fim_exe.set(found)
+            self.fim_settings_status.set(
+                "proxy executable detected" if found
+                else "proxy executable not found - Browse to it"
+            )
+        self._save_fim_launch_settings()
+
+    def browse_fim_workspace(self) -> None:
+        current = Path(self.fim_workspace.get() or Path.home()).expanduser()
+        path = filedialog.askdirectory(
+            initialdir=str(current if current.is_dir() else Path.home())
+        )
+        if path:
+            self.fim_workspace.set(path)
+            self._save_fim_launch_settings()
+
+    def refresh_fim_workspace(self) -> None:
+        path = self.fim_workspace.get().strip()
+        self.fim_workspace.set(path)
+        self._save_fim_launch_settings()
+        if path and not Path(path).expanduser().is_dir():
+            self.fim_settings_status.set("workspace folder not found")
 
     def load_fim_settings(self) -> None:
         # Retrieval lives in the proxy config.toml, independent of the extension JSON.
@@ -746,18 +815,26 @@ class LauncherApp:
         self._append_log(f"[fim] settings saved -> {path}")
 
     def refresh_fim_status(self) -> None:
+        config = self.fim_config.get()  # Tk variables are read on the UI thread only
+
         def work():
             try:
-                status = fim_proxy_status()
+                status = fim_proxy_status(config)
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                self.root.after(0, lambda: self.fim_status.set(f"Status error: {exc}"))
+                text = f"Status error: {exc}"
+                self.root.after(0, lambda: self.fim_status.set(text))
                 return
-            self.root.after(0, lambda: self._apply_fim_status(status))
+            self.root.after(0, lambda: self._apply_fim_status(status, config))
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _apply_fim_status(self, status: dict) -> None:
-        self.fim_task_state.set(status.get("task_state", "Unknown"))
+    def _apply_fim_status(self, status: dict, config: str | None = None) -> None:
+        if config is not None and config != self.fim_config.get():
+            return  # answer for a config that has since been changed; a newer check is running
+        process_state = status.get("process_state", "Unknown")
+        self.fim_process_state.set(process_state)
+        if status.get("endpoint"):
+            self.fim_endpoint.set(status["endpoint"])
         if status.get("listening"):
             self.fim_status.set("Running")
             self.fim_backend.set(
@@ -767,34 +844,55 @@ class LauncherApp:
             chunks = status.get("indexed_chunks")
             self.fim_chunks.set("-" if chunks is None else f"{chunks:,}")
         else:
-            self.fim_status.set("Not responding")
+            if process_state.startswith("Running"):
+                self.fim_status.set("Not responding")
+            elif process_state.startswith("Starting"):
+                self.fim_status.set("Starting...")
+            else:
+                self.fim_status.set("Stopped")
             self.fim_backend.set("-")
             self.fim_chunks.set("-")
 
-    def _fim_action(self, action, label: str) -> None:
+    def _fim_action(self, action, label: str, wait_until_ready: bool = False) -> None:
         self.fim_status.set(f"{label}...")
+        self._save_fim_launch_settings()
+        config = self.fim_config.get()
 
         def work():
             try:
                 message = action()
             except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                self.root.after(0, lambda: messagebox.showerror(f"FIM proxy {label} failed", str(exc)))
+                text = str(exc)
+                self.root.after(0, lambda: messagebox.showerror(f"FIM proxy {label} failed", text))
                 self.root.after(0, self.refresh_fim_status)
                 return
             self.root.after(0, lambda: self._append_log(f"[fim] {message}"))
-            time.sleep(1.5)
+            if wait_until_ready:
+                # The proxy loads its backend model before it answers /health.
+                self.root.after(0, lambda: self.fim_status.set("starting..."))
+                deadline = time.monotonic() + 90
+                while time.monotonic() < deadline and not fim_proxy_health(config):
+                    time.sleep(1.0)
+            else:
+                time.sleep(0.5)
             self.root.after(0, self.refresh_fim_status)
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _fim_launch_args(self) -> tuple[str, str, str]:
+        return self.fim_exe.get(), self.fim_config.get(), self.fim_workspace.get()
+
     def start_fim_proxy(self) -> None:
-        self._fim_action(fim_proxy_start, "start")
+        args = self._fim_launch_args()
+        self._fim_action(lambda: fim_proxy_start(*args), "start", wait_until_ready=True)
 
     def stop_fim_proxy(self) -> None:
-        self._fim_action(fim_proxy_stop, "stop")
+        config = self.fim_config.get()
+        self._fim_action(lambda: fim_proxy_stop(config), "stop")
 
     def restart_fim_proxy(self) -> None:
-        self._fim_action(fim_proxy_restart, "restart")
+        args = self._fim_launch_args()
+        self._fim_action(lambda: fim_proxy_restart(*args), "restart", wait_until_ready=True)
 
     def _path_row(self, parent, row, label, variable, browse_command, refresh_command, group=None):
         label_widget = ttk.Label(parent, text=label)
@@ -936,6 +1034,8 @@ class LauncherApp:
         self.settings["custom_model_folder"] = self.custom_folder.get()
         self.settings["hf_cache_dir"] = self.hf_cache_dir.get()
         self.settings["fim_proxy_config"] = self.fim_config.get().strip() or FIM_PROXY_CONFIG
+        self.settings["fim_proxy_executable"] = self.fim_exe.get().strip()
+        self.settings["fim_proxy_workspace"] = self.fim_workspace.get().strip()
         self.store.save(self.settings)
         self._refresh_profiles()
         self._append_log(f"[launcher] Saved profile: {name}")

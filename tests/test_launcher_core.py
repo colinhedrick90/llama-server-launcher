@@ -1,4 +1,5 @@
 import json
+import socket
 import sys
 import tempfile
 import time
@@ -659,6 +660,169 @@ class FimConfigTests(unittest.TestCase):
                 self.assertEqual({}, fim_ext_config_load())
                 with self.assertRaises(RuntimeError):
                     fim_ext_config_save({"enabled": True})
+
+
+FAKE_PROXY_SOURCE = r'''
+"""Stand-in for fim-context-proxy: serves /health on the port in --config."""
+import argparse, json, tomllib
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--config", required=True)
+parser.add_argument("--workspace", default="")
+args = parser.parse_args()
+with open(args.config, "rb") as handle:
+    server = tomllib.load(handle)["server"]
+if server.get("crash"):
+    raise SystemExit("fake proxy told to crash")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"status": "ok", "backend": "ready", "backend_mode": "managed",
+                           "backend_url": "http://127.0.0.1:1", "indexed_chunks": 42,
+                           "workspace": args.workspace}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+HTTPServer((server["host"], server["port"]), Handler).serve_forever()
+'''
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+class FimProxyControlTests(unittest.TestCase):
+    """Start/stop the proxy as a plain detached process - no OS service."""
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.root = Path(self._temp.name)
+        self.port = _free_port()
+        self.config = self.root / "proj" / "config.toml"
+        self.config.parent.mkdir()
+        self._write_config()
+        # A launchable "fim-context-proxy" that runs the fake with this Python.
+        # The script name carries the marker the stop guard looks for.
+        script = self.root / "proj" / "fim_context_proxy_fake.py"
+        script.write_text(FAKE_PROXY_SOURCE, encoding="utf-8")
+        if launcher_core.IS_WINDOWS:
+            self.exe = self.root / "proj" / "fim-context-proxy.cmd"
+            self.exe.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
+        else:
+            self.exe = self.root / "proj" / "fim-context-proxy"
+            self.exe.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{script}" "$@"\n', encoding="utf-8")
+            self.exe.chmod(0o755)
+        log = self.root / "fim-proxy.log"
+        patcher = mock.patch.object(launcher_core, "fim_proxy_log_path", lambda: log)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._force_stop)
+
+    def _write_config(self, crash: bool = False):
+        self.config.write_text(
+            f'[server]\nhost = "127.0.0.1"\nport = {self.port}\n'
+            + ("crash = true\n" if crash else "")
+            + "\n[retrieval]\nenabled = true\n",
+            encoding="utf-8",
+        )
+
+    def _force_stop(self):
+        try:
+            launcher_core.fim_proxy_stop(str(self.config))
+        except RuntimeError:
+            pass
+
+    def _wait_healthy(self, timeout: float = 20.0) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            health = launcher_core.fim_proxy_health(str(self.config), timeout=1.0)
+            if health:
+                return health
+            time.sleep(0.2)
+        self.fail("fake proxy never answered /health")
+
+    def test_endpoint_comes_from_the_selected_config(self):
+        self.assertEqual(("127.0.0.1", self.port), launcher_core.fim_proxy_endpoint(str(self.config)))
+        missing = str(self.root / "nope.toml")
+        self.assertEqual(("127.0.0.1", 8012), launcher_core.fim_proxy_endpoint(missing))
+
+    def test_builds_command_with_optional_workspace(self):
+        build = launcher_core.build_fim_proxy_command
+        self.assertEqual(["proxy", "--config", "c.toml"], build("proxy", "c.toml"))
+        self.assertEqual(["proxy", "--config", "c.toml"], build("proxy", "c.toml", "  "))
+        self.assertEqual(
+            ["proxy", "--config", "c.toml", "--workspace", str(self.root)],
+            build("proxy", "c.toml", str(self.root)),
+        )
+
+    def test_finds_executable_in_venv_beside_config(self):
+        name = "fim-context-proxy.exe" if launcher_core.IS_WINDOWS else "fim-context-proxy"
+        bin_dir = self.config.parent / ".venv" / ("Scripts" if launcher_core.IS_WINDOWS else "bin")
+        bin_dir.mkdir(parents=True)
+        (bin_dir / name).write_bytes(b"")
+        self.assertEqual(str(bin_dir / name), launcher_core.find_fim_proxy_executable(str(self.config)))
+
+    def test_start_reports_missing_config_and_executable(self):
+        with self.assertRaisesRegex(RuntimeError, "config not found"):
+            launcher_core.fim_proxy_start(str(self.exe), str(self.root / "nope.toml"))
+        with self.assertRaisesRegex(RuntimeError, "Could not find"):
+            launcher_core.fim_proxy_start(str(self.root / "no-such-exe"), str(self.config))
+        with self.assertRaisesRegex(RuntimeError, "Workspace folder not found"):
+            launcher_core.fim_proxy_start(str(self.exe), str(self.config), str(self.root / "nowhere"))
+
+    def test_start_surfaces_an_immediate_crash_with_its_output(self):
+        self._write_config(crash=True)
+        with self.assertRaisesRegex(RuntimeError, "exited immediately(.|\n)*told to crash"):
+            launcher_core.fim_proxy_start(str(self.exe), str(self.config))
+
+    def test_start_status_stop_round_trip(self):
+        workspace = self.root / "ws"
+        workspace.mkdir()
+        self.assertEqual("Stopped", launcher_core.fim_proxy_status(str(self.config))["process_state"])
+
+        message = launcher_core.fim_proxy_start(str(self.exe), str(self.config), str(workspace))
+        self.assertIn("starting", message)
+        health = self._wait_healthy()
+        self.assertEqual(str(workspace), health["workspace"])
+
+        status = launcher_core.fim_proxy_status(str(self.config))
+        self.assertTrue(status["listening"])
+        self.assertRegex(status["process_state"], r"^Running \(pid \d+\)$")
+        self.assertEqual(f"http://127.0.0.1:{self.port}", status["endpoint"])
+        self.assertEqual(42, status["indexed_chunks"])
+
+        # A second start must not launch a rival copy on the same port.
+        with self.assertRaisesRegex(RuntimeError, "already in use"):
+            launcher_core.fim_proxy_start(str(self.exe), str(self.config))
+
+        self.assertRegex(launcher_core.fim_proxy_stop(str(self.config)), r"stopped \(pid \d+\)")
+        self.assertEqual({}, launcher_core.fim_proxy_health(str(self.config), timeout=1.0))
+        self.assertEqual("Stopped", launcher_core.fim_proxy_status(str(self.config))["process_state"])
+        self.assertEqual("FIM proxy was not running.", launcher_core.fim_proxy_stop(str(self.config)))
+
+    def test_stop_leaves_an_unrelated_program_on_the_port_alone(self):
+        with socket.socket() as squatter:
+            squatter.bind(("127.0.0.1", self.port))
+            squatter.listen(8)
+            status = launcher_core.fim_proxy_status(str(self.config))
+            self.assertIn("another program", status["process_state"])
+            with self.assertRaisesRegex(RuntimeError, "another program"):
+                launcher_core.fim_proxy_stop(str(self.config))
+            # Still ours, still listening.
+            with socket.create_connection(("127.0.0.1", self.port), timeout=2):
+                pass
 
 
 if __name__ == "__main__":
