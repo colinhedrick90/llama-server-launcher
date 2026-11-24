@@ -55,6 +55,10 @@ from launcher_core import (
 # falls back to a proportional font, and Consolas does not exist on Linux.
 MONO_FONT = ("Consolas" if IS_WINDOWS else "monospace", 9)
 
+# On Linux Tk, "*.*" only matches filenames containing a literal dot and hides
+# extensionless binaries like llama-server; "*" matches every file.
+ALL_FILES_PATTERN = "*.*" if IS_WINDOWS else "*"
+
 class _Tooltip:
     """Minimal hover tooltip — Tkinter ships none."""
 
@@ -676,7 +680,7 @@ class LauncherApp:
         current = Path(self.fim_config.get() or FIM_PROXY_CONFIG).expanduser()
         path = filedialog.askopenfilename(
             initialdir=str(current.parent if current.parent.is_dir() else Path.home()),
-            filetypes=[("TOML files", "*.toml"), ("All files", "*.*")],
+            filetypes=[("TOML files", "*.toml"), ("All files", ALL_FILES_PATTERN)],
         )
         if path:
             self.fim_config.set(path)
@@ -706,9 +710,9 @@ class LauncherApp:
         path = filedialog.askopenfilename(
             initialdir=str(current.parent if current.parent.is_dir() else Path.home()),
             filetypes=(
-                [("Executable", "*.exe"), ("All files", "*.*")]
+                [("Executable", "*.exe"), ("All files", ALL_FILES_PATTERN)]
                 if IS_WINDOWS
-                else [("All files", "*.*")]
+                else [("All files", ALL_FILES_PATTERN)]
             ),
         )
         if path:
@@ -1056,9 +1060,9 @@ class LauncherApp:
     def browse_server(self) -> None:
         path = filedialog.askopenfilename(
             filetypes=(
-                [("Executable", "*.exe"), ("All files", "*.*")]
+                [("Executable", "*.exe"), ("All files", ALL_FILES_PATTERN)]
                 if IS_WINDOWS
-                else [("All files", "*.*")]
+                else [("All files", ALL_FILES_PATTERN)]
             )
         )
         if path:
@@ -1079,7 +1083,7 @@ class LauncherApp:
     def browse_models_preset(self) -> None:
         path = filedialog.askopenfilename(
             initialdir=self.models_dir.get() or str(default_model_root()),
-            filetypes=[("INI files", "*.ini"), ("All files", "*.*")],
+            filetypes=[("INI files", "*.ini"), ("All files", ALL_FILES_PATTERN)],
         )
         if path:
             self.models_preset.set(path)

@@ -46,5 +46,22 @@ class DeferredExceptionTests(unittest.TestCase):
         self.assertEqual([], _late_exception_reads(tree))
 
 
+class FileDialogFilterTests(unittest.TestCase):
+    def test_no_hardcoded_star_dot_star_in_filedialog_filetypes(self):
+        """Linux Tk treats '*.*' literally and hides extensionless executables."""
+        tree = ast.parse(APP_SOURCE.read_text(encoding="utf-8"))
+        bad = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw in node.keywords:
+                if kw.arg != "filetypes":
+                    continue
+                for inner in ast.walk(kw.value):
+                    if isinstance(inner, ast.Constant) and inner.value == "*.*":
+                        bad.append(f"line {inner.lineno}: hardcoded '*.*' in filetypes")
+        self.assertEqual([], bad)
+
+
 if __name__ == "__main__":
     unittest.main()
